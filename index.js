@@ -1,7 +1,7 @@
 import express from 'express';
 import path from "node:path";
 import { fileURLToPath } from 'node:url';
-import { init, getAuthToken } from "@heyputer/puter.js/src/init.cjs";
+import { EdgeTTS, Constants } from '@andresaya/edge-tts';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
@@ -12,26 +12,25 @@ const PDFParse = pdfParseModule.PDFParse;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Puter with your token
-let authToken = await getAuthToken();
-let puter = init(authToken);
+// Initialize EdgeTTS
+const tts = new EdgeTTS();
 
 const app = express();
 
 // ===== CONFIGURATION =====
 const CONFIG = {
-    // Set this to true to use test mode (free, returns sample audio)
-    TEST_MODE: false,
+    // Voice to use for synthesis
+    VOICE: 'en-US-AriaNeural',
 
     // How many chunks to process (null = all chunks)
-    // Set to a small number like 5 to test without using all credits
+    // Set to a small number like 5 to test
     MAX_CHUNKS_TO_PROCESS: null,
 
     // Start from a specific chunk (useful for resuming)
     START_CHUNK: 1,
 
     // Delay between API calls (in milliseconds)
-    DELAY_BETWEEN_CHUNKS: 1000,
+    DELAY_BETWEEN_CHUNKS: 500,
 };
 
 // --- Clean text helper ---
@@ -47,7 +46,7 @@ function cleanText(text) {
 
 async function run() {
     console.log("Running...");
-    console.log(`Test Mode: ${CONFIG.TEST_MODE}`);
+    console.log(`Voice: ${CONFIG.VOICE}`);
     console.log(`Max Chunks: ${CONFIG.MAX_CHUNKS_TO_PROCESS || 'All'}`);
     console.log(`Starting from chunk: ${CONFIG.START_CHUNK}`);
 
@@ -106,7 +105,10 @@ async function run() {
         const chunksToProcess = chunks.slice(startIdx, endIdx);
         console.log(`Processing chunks ${CONFIG.START_CHUNK} to ${startIdx + chunksToProcess.length}...`);
 
-        const audioBuffers = [];
+        const outputFilename = "output.mp3";
+        const outputPath = path.join(__dirname, outputFilename);
+        const writeStream = fs.createWriteStream(outputPath);
+
         let successCount = 0;
         let failCount = 0;
 
@@ -114,7 +116,6 @@ async function run() {
             const chunkNumber = startIdx + i + 1;
             console.log(`\n[${chunkNumber}/${chunks.length}] Processing...`);
             console.log(`Chunk length: ${chunksToProcess[i].length} characters`);
-            console.log(`Preview: ${chunksToProcess[i].slice(0, 80)}...`);
 
             try {
                 const textToConvert = chunksToProcess[i].trim();
@@ -124,70 +125,39 @@ async function run() {
                     continue;
                 }
 
-                if (textToConvert.length > 3000) {
-                    console.error(`⚠ Chunk exceeds 3000 character limit, skipping`);
-                    failCount++;
-                    continue;
-                }
+                await tts.synthesize(textToConvert, CONFIG.VOICE, {
+                    outputFormat: Constants.OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+                });
 
-                const audioElement = await puter.ai.txt2speech(textToConvert);
-
-                console.log(`Audio element received`);
-
-                const response = await fetch(audioElement.src);
-                const arrayBuffer = await response.arrayBuffer();
-                const buffer = Buffer.from(arrayBuffer);
+                const buffer = tts.toBuffer();
 
                 if (buffer && buffer.length > 0) {
-                    audioBuffers.push(buffer);
+                    writeStream.write(buffer);
                     successCount++;
-                    console.log(`✓ Converted successfully (${buffer.length} bytes)`);
+                    console.log(`✓ Converted and appended successfully (${buffer.length} bytes)`);
                 } else {
                     console.error(`⚠ Failed to get buffer`);
                     failCount++;
                 }
             } catch (chunkError) {
                 failCount++;
-
-                // Check if it's an insufficient funds error
-                if (chunkError.error && chunkError.error.code === 'insufficient_funds') {
-                    console.error(`❌ INSUFFICIENT FUNDS - Stopping process`);
-                    console.error(`Successfully processed: ${successCount} chunks`);
-                    console.error(`Failed: ${failCount} chunks`);
-                    console.error(`\nTo continue, please:`);
-                    console.error(`1. Add credits to your Puter account, OR`);
-                    console.error(`2. Set TEST_MODE: true in CONFIG (for testing), OR`);
-                    console.error(`3. Set MAX_CHUNKS_TO_PROCESS to a lower number`);
-                    break; // Stop processing
-                }
-
-                console.error(`❌ Error: ${chunkError.message || 'Unknown error'}`);
-                if (chunkError.error) {
-                    console.error("Error details:", chunkError.error);
-                }
+                console.error(`❌ Error synthesizing chunk ${chunkNumber}: ${chunkError.message || 'Unknown error'}`);
             }
 
-            // Delay between chunks
+            // Delay between chunks to avoid being flagged
             if (i < chunksToProcess.length - 1) {
                 await new Promise(resolve => setTimeout(resolve, CONFIG.DELAY_BETWEEN_CHUNKS));
             }
         }
 
-        // --- Combine chunks ---
-        if (audioBuffers.length > 0) {
-            const finalBuffer = Buffer.concat(audioBuffers);
-            const outputFilename = CONFIG.TEST_MODE ? "output-test.mp3" : "output.mp3";
-            const outputPath = path.join(__dirname, outputFilename);
-            fs.writeFileSync(outputPath, finalBuffer);
+        writeStream.end();
 
-            console.log(`\n✅ SUCCESS!`);
-            console.log(`File saved: ${outputPath}`);
-            console.log(`Total size: ${(finalBuffer.length / 1024 / 1024).toFixed(2)} MB`);
-            console.log(`Chunks processed: ${successCount}/${chunksToProcess.length}`);
-            console.log(`Failed chunks: ${failCount}`);
-        } else {
-            console.error("\n❌ No audio buffers were created");
-        }
+        writeStream.on('finish', () => {
+            console.log(`\n✅ ALL DONE!`);
+            console.log(`Full audio saved: ${outputPath}`);
+            console.log(`Total chunks processed: ${successCount}/${chunksToProcess.length}`);
+            if (failCount > 0) console.log(`Failed chunks: ${failCount}`);
+        });
 
     } catch (error) {
         console.error("\nFatal error during conversion:", error);
